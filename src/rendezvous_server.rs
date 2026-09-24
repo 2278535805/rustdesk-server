@@ -69,6 +69,23 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
+// Punch requests a UDP PunchHoleSent may answer, keyed by (target id, requester
+// address). The requester address comes from the TCP PunchHoleRequest, so a UDP
+// PunchHoleSent can only be answered to an address that asked for this punch:
+// its own UDP source is spoofable and is never used as a destination.
+static UDP_PUNCH_REQS: Lazy<TokioMutex<HashMap<(String, SocketAddr), Instant>>> =
+    Lazy::new(|| TokioMutex::new(HashMap::new()));
+const UDP_PUNCH_REQ_TTL_SEC: u64 = 15;
+const UDP_PUNCH_REQS_MAX: usize = 4096;
+
+async fn take_udp_punch_req(id: &str, requester: SocketAddr) -> bool {
+    let mut reqs = UDP_PUNCH_REQS.lock().await;
+    match reqs.remove(&(id.to_owned(), requester)) {
+        Some(tm) => tm.elapsed().as_secs() < UDP_PUNCH_REQ_TTL_SEC,
+        None => false,
+    }
+}
+
 #[derive(Clone)]
 struct Inner {
     serial: i32,
@@ -458,10 +475,27 @@ impl RendezvousServer {
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    // Answer only a punch that was requested over TCP for this id by the
+                    // address the peer claims to answer, so the spoofable UDP source can
+                    // never turn this into a reflection/amplification.
+                    let requester = AddrMangle::decode(&phs.socket_addr);
+                    if take_udp_punch_req(&phs.id, requester).await {
+                        allow_err!(self.handle_hole_sent(phs, addr, None, true).await);
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
+                }
+                Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                    // STUN-like: answer the source with the port it was observed from, which is
+                    // what the client's UDP NAT test needs to advertise a reachable udp_port.
+                    // No ConfigUpdate here, so a spoofed source cannot ask for a larger reply.
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_test_nat_response(TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    });
+                    socket.send(&msg_out, addr).await?;
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -554,7 +588,7 @@ impl RendezvousServer {
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    allow_err!(self.handle_hole_sent(phs, addr, None).await);
+                    allow_err!(self.handle_hole_sent(phs, addr, None, false).await);
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
@@ -639,6 +673,7 @@ impl RendezvousServer {
         phs: PunchHoleSent,
         addr: SocketAddr,
         socket: Option<&'a mut FramedSocket>,
+        is_udp: bool,
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
@@ -653,6 +688,7 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            is_udp,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -796,8 +832,19 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    udp_port: ph.udp_port,
                     ..Default::default()
                 });
+                // Record the request for the UDP PunchHoleSent that may answer it.
+                {
+                    let mut reqs = UDP_PUNCH_REQS.lock().await;
+                    if reqs.len() >= UDP_PUNCH_REQS_MAX {
+                        reqs.retain(|_, tm| tm.elapsed().as_secs() < UDP_PUNCH_REQ_TTL_SEC);
+                    }
+                    if reqs.len() < UDP_PUNCH_REQS_MAX {
+                        reqs.insert((id.clone(), addr), Instant::now());
+                    }
+                }
             }
             Ok((msg_out, Some(peer_addr)))
         } else {
